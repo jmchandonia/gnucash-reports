@@ -40,6 +40,15 @@ EXPENSE_CATEGORY_PATTERNS = {
     "education": re.compile(r"Education|School|Tuition|Books", re.I),
     "housing":   re.compile(r"Housing|Rent|Mortgage|Utilities|Property", re.I),
 }
+PLOT_COLORS = {
+    "bank": "#1f77b4",
+    "retirement": "#ff7f0e",
+    "education": "#2ca02c",
+    "housing": "#d62728",
+    "other": "#7f7f7f",
+    "investment": "#9467bd",
+    "net": "#ff9900",
+}
 # ----------------------------------------------------------------------
 
 
@@ -372,8 +381,7 @@ def _education_projection(
     target: float = 18000.0,
 ) -> pd.Series:
     proj = pd.Series(0.0, index=periods)
-    if exp_df.empty:
-        exp_df = pd.DataFrame(columns=["period", "education"])
+    per_month = target / 4.0
     for year in sorted(set(p.year for p in periods)):
         for start_month, end_month in ((1, 4), (8, 11)):
             window_periods = [
@@ -382,14 +390,6 @@ def _education_projection(
             ]
             if not window_periods:
                 continue
-            mask = (
-                (exp_df["period"] <= end_period)
-                & (exp_df["period"].dt.year == year)
-                & (exp_df["period"].dt.month.between(start_month, end_month))
-            )
-            actual_sum = exp_df.loc[mask, "education"].sum()
-            remaining = max(0.0, target - actual_sum)
-            per_month = remaining / len(window_periods)
             proj.loc[window_periods] = per_month
     return proj
 
@@ -454,7 +454,7 @@ def _net_window_details(net_df: pd.DataFrame, window: int = 6) -> pd.Series:
 
 def build_net_projection(proj_inc: pd.DataFrame, proj_exp: pd.DataFrame) -> pd.DataFrame:
     if proj_inc is None or proj_exp is None or proj_inc.empty or proj_exp.empty:
-        return pd.DataFrame(columns=["period", "net_bank_flow", "summary"])
+        return pd.DataFrame(columns=["period", "bank", "total_exp", "net_bank_flow", "net_window_details"])
     merged = pd.merge(
         proj_inc[["period", "bank"]],
         proj_exp[["period", "total_exp"]],
@@ -462,14 +462,16 @@ def build_net_projection(proj_inc: pd.DataFrame, proj_exp: pd.DataFrame) -> pd.D
         how="inner",
     )
     merged["net_bank_flow"] = merged["bank"] - merged["total_exp"]
-    merged["summary"] = "Projection"
+    merged["net_window_details"] = _net_window_details(merged, window=6)
     return merged
 
 
 def build_values_projection(
     values_df: pd.DataFrame,
     proj_net_df: pd.DataFrame,
+    proj_inc_df: pd.DataFrame,
     end_period: pd.Period,
+    account_details: pd.DataFrame,
 ) -> pd.DataFrame:
     if values_df.empty or proj_net_df.empty:
         return pd.DataFrame(
@@ -497,15 +499,62 @@ def build_values_projection(
             ]
         )
     last_row = last_actual.sort_values("period").iloc[-1]
-    liquidation = last_row["investment"] + last_row["retirement"]
-    start_bank = last_row["bank"] + liquidation
+    bank = float(last_row["bank"])
+    investment = float(last_row["investment"])
+    retirement = float(last_row["retirement"])
+    investment_accounts = []
+    if account_details is not None and not account_details.empty:
+        end_investments = account_details[
+            (account_details["period"] == end_period)
+            & (account_details["account_type"] == "investment")
+        ].copy()
+        if not end_investments.empty:
+            end_investments = end_investments.sort_values("balance", ascending=False)
+            for _, row in end_investments.iterrows():
+                balance = float(row["balance"])
+                if balance > 0:
+                    investment_accounts.append(
+                        {"name": row["full_account_name"], "balance": balance}
+                    )
+    remaining_investment_total = sum(item["balance"] for item in investment_accounts) or investment
+    investment = remaining_investment_total
+
     proj = proj_net_df.sort_values("period").copy()
-    proj["bank"] = start_bank + proj["net_bank_flow"].cumsum()
-    proj["investment"] = 0.0
-    proj["retirement"] = 0.0
-    proj["bank_summary"] = "Projection (liquidated investments)"
-    proj["investment_summary"] = "Projection (sold)"
-    proj["retirement_summary"] = "Projection (sold)"
+    proj["bank"] = np.nan
+    proj["investment"] = np.nan
+    proj["retirement"] = np.nan
+    proj["bank_summary"] = ""
+    proj["investment_summary"] = ""
+    proj["retirement_summary"] = ""
+    retirement_lookup = {}
+    if proj_inc_df is not None and not proj_inc_df.empty:
+        retirement_lookup = dict(
+            zip(proj_inc_df["period"].tolist(), proj_inc_df["retirement"].tolist())
+        )
+
+    for idx, row in proj.iterrows():
+        net_flow = float(row["net_bank_flow"]) if not pd.isna(row["net_bank_flow"]) else 0.0
+        bank += net_flow
+        retirement += float(retirement_lookup.get(row["period"], 0.0))
+        sold_notes = []
+        while bank < 0 and investment_accounts:
+            sold = investment_accounts.pop(0)
+            sold_amount = sold["balance"]
+            bank += sold_amount
+            investment -= sold_amount
+            sold_notes.append(f"Sold {sold['name']} (${int(round(sold_amount))})")
+        proj.at[idx, "bank"] = bank
+        proj.at[idx, "investment"] = max(investment, 0.0)
+        proj.at[idx, "retirement"] = retirement
+        if sold_notes:
+            note = "; ".join(sold_notes)
+            proj.at[idx, "bank_summary"] = f"Projection ({note})"
+            proj.at[idx, "investment_summary"] = f"Projection ({note})"
+        else:
+            proj.at[idx, "bank_summary"] = "Projection"
+            proj.at[idx, "investment_summary"] = "Projection"
+        proj.at[idx, "retirement_summary"] = "Projection"
+
     return proj[
         [
             "period",
@@ -519,7 +568,11 @@ def build_values_projection(
     ]
 
 
-def build_yearly_account_table(values_df: pd.DataFrame, proj_values_df: pd.DataFrame | None) -> list[dict]:
+def build_yearly_account_table(
+    values_df: pd.DataFrame,
+    proj_values_df: pd.DataFrame | None,
+    end_period: pd.Period,
+) -> list[dict]:
     if values_df.empty and (proj_values_df is None or proj_values_df.empty):
         return []
     combined = values_df.copy()
@@ -527,24 +580,19 @@ def build_yearly_account_table(values_df: pd.DataFrame, proj_values_df: pd.DataF
         combined = pd.concat([combined, proj_values_df], ignore_index=True)
     combined = combined.dropna(subset=["period"])
     combined["year"] = combined["period"].dt.year
-    year_end = (
-        combined.sort_values("period")
-        .groupby("year")
-        .tail(1)
-        .sort_values("year")
-        .reset_index(drop=True)
-    )
+    combined_sorted = combined.sort_values("period")
+    year_groups = combined_sorted.groupby("year")
+    year_end = year_groups.tail(1).sort_values("year").reset_index(drop=True)
+    year_start = year_groups.head(1).set_index("year")
     rows = []
-    prev = None
     for _, row in year_end.iterrows():
+        start_row = year_start.loc[row["year"]]
         total = row["bank"] + row["investment"] + row["retirement"]
-        if prev is None:
-            bank_change = investment_change = retirement_change = total_change = 0.0
-        else:
-            bank_change = row["bank"] - prev["bank"]
-            investment_change = row["investment"] - prev["investment"]
-            retirement_change = row["retirement"] - prev["retirement"]
-            total_change = total - (prev["bank"] + prev["investment"] + prev["retirement"])
+        bank_change = row["bank"] - start_row["bank"]
+        investment_change = row["investment"] - start_row["investment"]
+        retirement_change = row["retirement"] - start_row["retirement"]
+        total_change = total - (start_row["bank"] + start_row["investment"] + start_row["retirement"])
+        projected = bool(row["period"] > end_period)
         rows.append(
             {
                 "year": int(row["year"]),
@@ -556,9 +604,9 @@ def build_yearly_account_table(values_df: pd.DataFrame, proj_values_df: pd.DataF
                 "retirement_change": int(round(retirement_change)),
                 "total_value": int(round(total)),
                 "total_change": int(round(total_change)),
+                "projected": projected,
             }
         )
-        prev = row
     return rows
 
 
@@ -621,12 +669,12 @@ def _fetch_yahoo_prices(symbol: str, start: datetime, end: datetime) -> list[tup
 
 
 def _symbol_for_commodity(space: str, mnemonic: str) -> str:
-    if not mnemonic:
+    if not mnemonic or not space:
         return ""
-    if space.upper() in ("NYSE", "NASDAQ", "AMEX", "US"):
+    public_spaces = {"NYSE", "NASDAQ", "AMEX", "US"}
+    if space.upper() in public_spaces:
         return mnemonic
-    return mnemonic
-
+    return ""
 
 def _price_series_for_commodity(
     space: str,
@@ -637,16 +685,16 @@ def _price_series_for_commodity(
     cache_path: Path,
 ) -> pd.Series:
     symbol = _symbol_for_commodity(space, mnemonic)
-    if not symbol:
-        return pd.Series(index=periods, dtype=float)
-    cache = _load_price_cache(cache_path)
-    cache_key = symbol.upper()
+    cache = {}
     cached_prices = []
-    for item in cache.get(cache_key, []):
-        try:
-            cached_prices.append((pd.to_datetime(item[0]), float(item[1])))
-        except (ValueError, TypeError):
-            continue
+    if symbol:
+        cache = _load_price_cache(cache_path)
+        cache_key = symbol.upper()
+        for item in cache.get(cache_key, []):
+            try:
+                cached_prices.append((pd.to_datetime(item[0]), float(item[1])))
+            except (ValueError, TypeError):
+                continue
 
     def _naive(ts: pd.Timestamp) -> pd.Timestamp:
         return ts.tz_localize(None) if getattr(ts, "tzinfo", None) else ts
@@ -660,15 +708,17 @@ def _price_series_for_commodity(
         all_prices = sorted(all_prices, key=lambda x: x[0])
     start = periods.min().to_timestamp(how="start").tz_localize(None)
     end = periods.max().to_timestamp(how="end").tz_localize(None)
-    need_fetch = True
-    if all_prices:
-        need_fetch = all_prices[0][0] > start or all_prices[-1][0] < end
-    if need_fetch:
-        fetched = _fetch_yahoo_prices(symbol, start.to_pydatetime(), end.to_pydatetime())
-        if fetched:
-            all_prices = sorted(all_prices + fetched, key=lambda x: x[0])
-            cache[cache_key] = [(d.strftime("%Y-%m-%d"), p) for d, p in all_prices]
-            _save_price_cache(cache_path, cache)
+    if symbol and not cached_prices:
+        need_fetch = True
+        if all_prices:
+            need_fetch = all_prices[0][0] > start or all_prices[-1][0] < end
+        if need_fetch:
+            fetched = _fetch_yahoo_prices(symbol, start.to_pydatetime(), end.to_pydatetime())
+            if fetched:
+                all_prices = sorted(all_prices + fetched, key=lambda x: x[0])
+                cache_key = symbol.upper()
+                cache[cache_key] = [(d.strftime("%Y-%m-%d"), p) for d, p in all_prices]
+                _save_price_cache(cache_path, cache)
 
     if not all_prices:
         return pd.Series(index=periods, dtype=float)
@@ -682,7 +732,6 @@ def _price_series_for_commodity(
     price_at_period = series.reindex(period_ends, method="ffill")
     price_at_period.index = periods
     return price_at_period
-
 
 def net_cash_flow(inc_df, exp_df):
     merged = pd.merge(
@@ -715,9 +764,19 @@ def net_cash_flow(inc_df, exp_df):
     return merged
 
 
-def monthly_account_values(df, pricedb: dict, cache_path: Path | None = None):
+def monthly_account_values(
+    df,
+    pricedb: dict,
+    cache_path: Path | None = None,
+    return_details: bool = False,
+):
     if df.empty:
-        return pd.DataFrame(columns=["period", "bank", "investment", "retirement"])
+        values = pd.DataFrame(columns=["period", "bank", "investment", "retirement"])
+        if return_details:
+            return values, pd.DataFrame(
+                columns=["period", "account_type", "full_account_name", "balance"]
+            )
+        return values
 
     if cache_path is None:
         cache_path = Path("price_cache.json")
@@ -837,6 +896,9 @@ def monthly_account_values(df, pricedb: dict, cache_path: Path | None = None):
     for col in ("bank_summary", "investment_summary", "retirement_summary"):
         if col not in values.columns:
             values[col] = ""
+    if return_details:
+        details = per_account_full.rename(columns={"window_period": "period"})
+        return values, details
     return values
 
 
@@ -875,6 +937,7 @@ def build_plotly_data(
             "y": inc_df["bank"].tolist(),
             "mode": "lines+markers",
             "name": "Bank Income",
+            "line": {"color": PLOT_COLORS["bank"]},
             "customdata": inc_df["bank_summary"].fillna("").tolist(),
             "hovertemplate": (
                 "Month: %{x}<br>"
@@ -887,6 +950,7 @@ def build_plotly_data(
             "y": inc_df["retirement"].tolist(),
             "mode": "lines+markers",
             "name": "Retirement Income",
+            "line": {"color": PLOT_COLORS["retirement"]},
             "customdata": inc_df["retirement_summary"].fillna("").tolist(),
             "hovertemplate": (
                 "Month: %{x}<br>"
@@ -903,7 +967,7 @@ def build_plotly_data(
                     "y": proj_inc_df["bank"].tolist(),
                     "mode": "lines+markers",
                     "name": "Projected Bank Income",
-                    "line": {"dash": "dot"},
+                    "line": {"dash": "dot", "color": PLOT_COLORS["bank"]},
                     "opacity": 0.6,
                     "customdata": proj_inc_df["bank_summary"].fillna("").tolist(),
                     "hovertemplate": (
@@ -917,7 +981,7 @@ def build_plotly_data(
                     "y": proj_inc_df["retirement"].tolist(),
                     "mode": "lines+markers",
                     "name": "Projected Retirement Income",
-                    "line": {"dash": "dot"},
+                    "line": {"dash": "dot", "color": PLOT_COLORS["retirement"]},
                     "opacity": 0.6,
                     "customdata": proj_inc_df["retirement_summary"].fillna("").tolist(),
                     "hovertemplate": (
@@ -936,6 +1000,7 @@ def build_plotly_data(
             "y": exp_df["education"].tolist(),
             "mode": "lines+markers",
             "name": "Education",
+            "line": {"color": PLOT_COLORS["education"]},
             "customdata": exp_df["education_summary"].fillna("").tolist(),
             "hovertemplate": (
                 "Month: %{x}<br>"
@@ -948,6 +1013,7 @@ def build_plotly_data(
             "y": exp_df["housing"].tolist(),
             "mode": "lines+markers",
             "name": "Housing",
+            "line": {"color": PLOT_COLORS["housing"]},
             "customdata": exp_df["housing_summary"].fillna("").tolist(),
             "hovertemplate": (
                 "Month: %{x}<br>"
@@ -960,6 +1026,7 @@ def build_plotly_data(
             "y": exp_df["other"].tolist(),
             "mode": "lines+markers",
             "name": "Other",
+            "line": {"color": PLOT_COLORS["other"]},
             "customdata": exp_df["other_summary"].fillna("").tolist(),
             "hovertemplate": (
                 "Month: %{x}<br>"
@@ -976,7 +1043,7 @@ def build_plotly_data(
                     "y": proj_exp_df["education"].tolist(),
                     "mode": "lines+markers",
                     "name": "Projected Education",
-                    "line": {"dash": "dot"},
+                    "line": {"dash": "dot", "color": PLOT_COLORS["education"]},
                     "opacity": 0.6,
                     "customdata": proj_exp_df["education_summary"].fillna("").tolist(),
                     "hovertemplate": (
@@ -990,7 +1057,7 @@ def build_plotly_data(
                     "y": proj_exp_df["housing"].tolist(),
                     "mode": "lines+markers",
                     "name": "Projected Housing",
-                    "line": {"dash": "dot"},
+                    "line": {"dash": "dot", "color": PLOT_COLORS["housing"]},
                     "opacity": 0.6,
                     "customdata": proj_exp_df["housing_summary"].fillna("").tolist(),
                     "hovertemplate": (
@@ -1004,7 +1071,7 @@ def build_plotly_data(
                     "y": proj_exp_df["other"].tolist(),
                     "mode": "lines+markers",
                     "name": "Projected Other",
-                    "line": {"dash": "dot"},
+                    "line": {"dash": "dot", "color": PLOT_COLORS["other"]},
                     "opacity": 0.6,
                     "customdata": proj_exp_df["other_summary"].fillna("").tolist(),
                     "hovertemplate": (
@@ -1023,7 +1090,7 @@ def build_plotly_data(
             "y": net_df["net_bank_flow_ma13"].tolist(),
             "mode": "lines+markers",
             "name": "Net Bank Flow (13-mo MA)",
-            "line": {"color": "#ff9900"},
+            "line": {"color": PLOT_COLORS["net"]},
             "customdata": net_df["net_window_details"].fillna("").tolist(),
             "hovertemplate": (
                 "Month: %{x}<br>"
@@ -1039,9 +1106,9 @@ def build_plotly_data(
                 "y": proj_net_df["net_bank_flow"].tolist(),
                 "mode": "lines+markers",
                 "name": "Projected Net Bank Flow",
-                "line": {"dash": "dot", "color": "#ff9900"},
+                "line": {"dash": "dot", "color": PLOT_COLORS["net"]},
                 "opacity": 0.6,
-                "customdata": proj_net_df["summary"].fillna("").tolist(),
+                "customdata": proj_net_df["net_window_details"].fillna("").tolist(),
                 "hovertemplate": (
                     "Month: %{x}<br>"
                     "Projected Net: %{y:.0f}<br>"
@@ -1058,6 +1125,7 @@ def build_plotly_data(
             "y": values_df["bank"].tolist(),
             "mode": "lines+markers",
             "name": "Bank Value",
+            "line": {"color": PLOT_COLORS["bank"]},
             "customdata": values_df["bank_summary"].fillna("").tolist(),
             "hovertemplate": (
                 "Month: %{x}<br>"
@@ -1070,6 +1138,7 @@ def build_plotly_data(
             "y": values_df["investment"].tolist(),
             "mode": "lines+markers",
             "name": "Investment Value",
+            "line": {"color": PLOT_COLORS["investment"]},
             "customdata": values_df["investment_summary"].fillna("").tolist(),
             "hovertemplate": (
                 "Month: %{x}<br>"
@@ -1082,6 +1151,7 @@ def build_plotly_data(
             "y": values_df["retirement"].tolist(),
             "mode": "lines+markers",
             "name": "Retirement Value",
+            "line": {"color": PLOT_COLORS["retirement"]},
             "customdata": values_df["retirement_summary"].fillna("").tolist(),
             "hovertemplate": (
                 "Month: %{x}<br>"
@@ -1098,7 +1168,7 @@ def build_plotly_data(
                     "y": proj_values_df["bank"].tolist(),
                     "mode": "lines+markers",
                     "name": "Projected Bank Value",
-                    "line": {"dash": "dot"},
+                    "line": {"dash": "dot", "color": PLOT_COLORS["bank"]},
                     "opacity": 0.6,
                     "customdata": proj_values_df["bank_summary"].fillna("").tolist(),
                     "hovertemplate": (
@@ -1112,7 +1182,7 @@ def build_plotly_data(
                     "y": proj_values_df["investment"].tolist(),
                     "mode": "lines+markers",
                     "name": "Projected Investment Value",
-                    "line": {"dash": "dot"},
+                    "line": {"dash": "dot", "color": PLOT_COLORS["investment"]},
                     "opacity": 0.6,
                     "customdata": proj_values_df["investment_summary"].fillna("").tolist(),
                     "hovertemplate": (
@@ -1126,7 +1196,7 @@ def build_plotly_data(
                     "y": proj_values_df["retirement"].tolist(),
                     "mode": "lines+markers",
                     "name": "Projected Retirement Value",
-                    "line": {"dash": "dot"},
+                    "line": {"dash": "dot", "color": PLOT_COLORS["retirement"]},
                     "opacity": 0.6,
                     "customdata": proj_values_df["retirement_summary"].fillna("").tolist(),
                     "hovertemplate": (
@@ -1162,6 +1232,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   table {{border-collapse:collapse;width:100%;margin-top:20px;}}
   th, td {{border:1px solid #ddd;padding:8px;text-align:center;}}
   th {{background:#f2f2f2;}}
+  td.negative {{color:#b00020;}}
+  td.projected {{font-style:italic;}}
 </style>
 </head>
 <body>
@@ -1174,6 +1246,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <div id="values" class="chart"></div>
 
 <h2>Yearly Account Totals</h2>
+<p>Values reflect the end of each year, with change shown relative to the first month of that year.</p>
 <div id="yearly_account_table"></div>
 
 <script>
@@ -1184,7 +1257,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     title: 'Monthly Income – Bank vs Retirement',
     xaxis: {{title:'Month'}},
     yaxis: {{title:'USD'}},
-    legend: {{orientation:'h'}}
+    legend: {{orientation:'h', x:0.5, xanchor:'center', y:-0.25, yanchor:'top'}},
+    margin: {{t:50, b:80}}
   }});
 
   // ---- Expenses ----
@@ -1192,21 +1266,26 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     title: 'Monthly Expenses – Education, Housing, Other',
     xaxis: {{title:'Month'}},
     yaxis: {{title:'USD'}},
-    legend: {{orientation:'h'}}
+    legend: {{orientation:'h', x:0.5, xanchor:'center', y:-0.25, yanchor:'top'}},
+    margin: {{t:50, b:80}}
   }});
 
   // ---- Net Cash Flow ----
   Plotly.newPlot('netflow', plotData.netflow, {{
     title: 'Net Cash Flow (Bank Income – All Expenses)',
     xaxis: {{title:'Month'}},
-    yaxis: {{title:'USD'}}
+    yaxis: {{title:'USD'}},
+    legend: {{orientation:'h', x:0.5, xanchor:'center', y:-0.25, yanchor:'top'}},
+    margin: {{t:50, b:80}}
   }});
 
   // ---- Account Values by Year ----
   Plotly.newPlot('values', plotData.values, {{
     title: 'Account Values by Month',
     xaxis: {{title:'Month'}},
-    yaxis: {{title:'USD'}}
+    yaxis: {{title:'USD'}},
+    legend: {{orientation:'h', x:0.5, xanchor:'center', y:-0.25, yanchor:'top'}},
+    margin: {{t:50, b:80}}
   }});
 
   // ---- Yearly Account Totals ----
@@ -1215,7 +1294,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     document.getElementById('yearly_account_table').textContent = 'No yearly data available.';
   }} else {{
     const hdr = yearlyTbl.insertRow();
-    const cols = Object.keys(plotData.yearly_account_table[0]);
+    const cols = Object.keys(plotData.yearly_account_table[0]).filter(c => c !== 'projected');
     cols.forEach(c => {{
       const th = document.createElement('th');
       th.textContent = c;
@@ -1226,6 +1305,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       cols.forEach(c => {{
         const td = tr.insertCell();
         td.textContent = row[c];
+        if (row.projected) {{
+          td.classList.add('projected');
+        }}
+        if (typeof row[c] === 'number' && row[c] < 0) {{
+          td.classList.add('negative');
+        }}
       }});
     }});
     document.getElementById('yearly_account_table').appendChild(yearlyTbl);
@@ -1268,7 +1353,11 @@ def main(gnucash_file: str, out_file: str = "report.html", start_year: int = 202
     inc_month = monthly_income(df)
     exp_month = monthly_expenses(df)
     net_month = net_cash_flow(inc_month, exp_month)
-    values_month = monthly_account_values(df_all, pricedb)
+    values_month, account_details = monthly_account_values(
+        df_all,
+        pricedb,
+        return_details=True,
+    )
     values_month = values_month[
         (values_month["period"] >= start_period) & (values_month["period"] <= end_period)
     ]
@@ -1277,13 +1366,19 @@ def main(gnucash_file: str, out_file: str = "report.html", start_year: int = 202
     if end_year_is_default:
         proj_inc, proj_exp = build_projections(inc_month, exp_month, end_period, months=12)
         proj_net = build_net_projection(proj_inc, proj_exp)
-        proj_values = build_values_projection(values_month, proj_net, end_period)
+        proj_values = build_values_projection(
+            values_month,
+            proj_net,
+            proj_inc,
+            end_period,
+            account_details,
+        )
 
     # Yearly aggregation and balances
     balances  = latest_balances(df)   # kept for completeness
 
     # Build Plotly JSON and write HTML
-    yearly_table = build_yearly_account_table(values_month, proj_values)
+    yearly_table = build_yearly_account_table(values_month, proj_values, end_period)
     plot_json = build_plotly_data(
         inc_month,
         exp_month,
