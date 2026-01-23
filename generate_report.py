@@ -18,6 +18,7 @@ import argparse
 import gzip
 import json
 import re
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 import xml.etree.ElementTree as ET
@@ -80,19 +81,83 @@ def _parse_fraction(value: str) -> float:
     return float(value)
 
 
-def load_gnucash(gnucash_path: Path) -> tuple[pd.DataFrame, dict]:
+def _render_progress(label: str, pct: float) -> None:
+    pct = min(max(pct, 0.0), 1.0)
+    bar_len = 30
+    filled = int(bar_len * pct)
+    bar = "#" * filled + "-" * (bar_len - filled)
+    sys.stdout.write(f"\r{label} [{bar}] {pct * 100:3.0f}%")
+    sys.stdout.flush()
+
+
+class ProgressTracker:
+    def __init__(self, label: str) -> None:
+        self.label = label
+        self.last_pct = -1.0
+
+    def update(self, pct: float) -> None:
+        pct = min(max(pct, 0.0), 1.0)
+        if pct <= self.last_pct:
+            return
+        if pct - self.last_pct < 0.005 and pct < 1.0:
+            return
+        self.last_pct = pct
+        _render_progress(self.label, pct)
+        if pct >= 1.0:
+            sys.stdout.write("\n")
+
+
+def _read_gnucash_bytes(path: Path, progress_cb=None) -> bytes:
+    total = path.stat().st_size if path.exists() else 0
+    with path.open("rb") as fh:
+        magic = fh.read(2)
+    if magic == b"\x1f\x8b":
+        try:
+            data = bytearray()
+            with path.open("rb") as raw_fh:
+                with gzip.GzipFile(fileobj=raw_fh) as gz_fh:
+                    while True:
+                        chunk = gz_fh.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        data.extend(chunk)
+                        if total > 0 and progress_cb is not None:
+                            progress_cb(raw_fh.tell() / total)
+            return bytes(data)
+        except OSError:
+            pass
+    data = bytearray()
+    with path.open("rb") as fh:
+        read = 0
+        while True:
+            chunk = fh.read(1024 * 1024)
+            if not chunk:
+                break
+            data.extend(chunk)
+            read += len(chunk)
+            if total > 0 and progress_cb is not None:
+                progress_cb(read / total)
+    return bytes(data)
+
+
+def load_gnucash(
+    gnucash_path: Path,
+    progress_tracker: ProgressTracker | None = None,
+) -> tuple[pd.DataFrame, dict]:
     """
     Read a GnuCash native file (compressed XML) and create the canonical
     columns that the rest of the pipeline expects:
         date, full_account_name, amount (float), value (float)
     """
-    try:
-        with gzip.open(gnucash_path, "rb") as fh:
-            tree = ET.parse(fh)
-    except OSError:
-        tree = ET.parse(gnucash_path)
-
-    root = tree.getroot()
+    progress_cb = None
+    if progress_tracker is not None:
+        progress_cb = lambda pct: progress_tracker.update(0.3 * pct)
+    data = _read_gnucash_bytes(gnucash_path, progress_cb=progress_cb)
+    if progress_tracker is not None:
+        progress_tracker.update(0.35)
+    root = ET.fromstring(data)
+    if progress_tracker is not None:
+        progress_tracker.update(0.4)
     ns = {
         "gnc": "http://www.gnucash.org/XML/gnc",
         "act": "http://www.gnucash.org/XML/act",
@@ -106,14 +171,17 @@ def load_gnucash(gnucash_path: Path) -> tuple[pd.DataFrame, dict]:
     accounts = {}
     parents = {}
     account_commodity = {}
+    account_types = {}
     for acct in root.findall(".//gnc:account", ns):
         guid = acct.findtext("act:id", default="", namespaces=ns)
         name = acct.findtext("act:name", default="", namespaces=ns)
         parent = acct.findtext("act:parent", default="", namespaces=ns)
+        act_type = acct.findtext("act:type", default="", namespaces=ns)
         space = acct.findtext("act:commodity/cmdty:space", default="", namespaces=ns)
         mnemonic = acct.findtext("act:commodity/cmdty:id", default="", namespaces=ns)
         accounts[guid] = name
         parents[guid] = parent
+        account_types[guid] = act_type
         account_commodity[guid] = {"space": space, "id": mnemonic}
 
     full_name_cache = {}
@@ -145,6 +213,7 @@ def load_gnucash(gnucash_path: Path) -> tuple[pd.DataFrame, dict]:
             quantity = _parse_fraction(split.findtext("split:quantity", default="", namespaces=ns))
             full_acct = full_name(acct_guid)
             commodity = account_commodity.get(acct_guid, {"space": "", "id": ""})
+            act_type = account_types.get(acct_guid, "")
             rows.append(
                 {
                     "date": date,
@@ -152,6 +221,7 @@ def load_gnucash(gnucash_path: Path) -> tuple[pd.DataFrame, dict]:
                     "description": desc,
                     "full_account_name": full_acct,
                     "account_name": full_acct.split(":")[-1] if full_acct else "",
+                    "account_act_type": act_type,
                     "amount_num": quantity,
                     "value_num": value,
                     "commodity_space": commodity.get("space", ""),
@@ -160,6 +230,7 @@ def load_gnucash(gnucash_path: Path) -> tuple[pd.DataFrame, dict]:
             )
 
     df = pd.DataFrame(rows)
+    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.tz_localize(None)
     df["amount"] = df["amount_num"]
     df["value"] = df["value_num"]
     df["period"] = df["date"].dt.to_period("M")
@@ -183,11 +254,16 @@ def load_gnucash(gnucash_path: Path) -> tuple[pd.DataFrame, dict]:
     return df, pricedb
 
 
-def classify_account(name: str) -> str:
+def classify_account(name: str, act_type: str) -> str:
     """Return 'bank', 'retirement', 'investment' or 'other'."""
     for typ, pat in ACCOUNT_TYPE_PATTERNS.items():
         if pat.search(name):
             return typ
+    act_type = (act_type or "").upper()
+    if act_type == "BANK":
+        return "bank"
+    if act_type == "STOCK":
+        return "investment"
     return "other"
 
 
@@ -207,7 +283,10 @@ def enrich(df: pd.DataFrame) -> pd.DataFrame:
         expense_category – education / housing / other   (only for expenses)
     """
     df = df.copy()
-    df["account_type"] = df["full_account_name"].apply(classify_account)
+    df["account_type"] = df.apply(
+        lambda row: classify_account(row["full_account_name"], row.get("account_act_type", "")),
+        axis=1,
+    )
     df["direction"]    = np.where(df["amount"] > 0, "income", "expense")
     expense_mask = df["full_account_name"].str.match(EXPENSE_ACCOUNT_PATTERN, na=False)
     df["expense_category"] = "other"
@@ -251,7 +330,7 @@ def _expense_amount(row: pd.Series) -> float:
 def _summarize_transactions(
     group: pd.DataFrame,
     amount_col: str,
-    threshold: float = 500.0,
+    threshold: float,
 ) -> str:
     """
     Summarize items over the threshold with date and amount,
@@ -277,7 +356,7 @@ def _summarize_transactions(
 # ----------------------------------------------------------------------
 # 2️⃣  AGGREGATIONS (monthly & yearly)
 # ----------------------------------------------------------------------
-def monthly_income(df):
+def monthly_income(df, detail_threshold: float):
     income_tx = _income_transfer_ids(df)
     inc = df[df["account_type"].isin(["bank", "retirement"])].copy()
     if not income_tx.empty:
@@ -296,8 +375,10 @@ def monthly_income(df):
             out[col] = 0.0
     out["total_income"] = out[["bank", "retirement"]].sum(axis=1)
     summaries = (
-        inc.groupby(["window_period", "account_type"])
-        .apply(_summarize_transactions, amount_col="income_amt")
+        inc.groupby(["window_period", "account_type"])[
+            ["date", "description", "full_account_name", "income_amt"]
+        ]
+        .apply(_summarize_transactions, amount_col="income_amt", threshold=detail_threshold)
         .reset_index(name="summary")
     )
     summaries = summaries.pivot(
@@ -319,7 +400,7 @@ def monthly_income(df):
     return out
 
 
-def monthly_expenses(df):
+def monthly_expenses(df, detail_threshold: float):
     exp = df[df["full_account_name"].str.match(EXPENSE_ACCOUNT_PATTERN, na=False)].copy()
     exp["signed_amount"] = exp.apply(_expense_amount, axis=1)
     out = (
@@ -336,8 +417,10 @@ def monthly_expenses(df):
     out["other"] = out.drop(columns="period").sum(axis=1) - out["education"] - out["housing"]
     out["total_exp"] = out[["education", "housing", "other"]].sum(axis=1)
     summaries = (
-        exp.groupby(["window_period", "expense_category"])
-        .apply(_summarize_transactions, amount_col="signed_amount")
+        exp.groupby(["window_period", "expense_category"])[
+            ["date", "description", "full_account_name", "signed_amount"]
+        ]
+        .apply(_summarize_transactions, amount_col="signed_amount", threshold=detail_threshold)
         .reset_index(name="summary")
     )
     summaries = summaries.pivot(
@@ -379,9 +462,11 @@ def _education_projection(
     exp_df: pd.DataFrame,
     end_period: pd.Period,
     target: float = 18000.0,
+    per_month: float | None = None,
 ) -> pd.Series:
     proj = pd.Series(0.0, index=periods)
-    per_month = target / 4.0
+    if per_month is None:
+        per_month = target / 4.0
     for year in sorted(set(p.year for p in periods)):
         for start_month, end_month in ((1, 4), (8, 11)):
             window_periods = [
@@ -399,10 +484,20 @@ def build_projections(
     exp_df: pd.DataFrame,
     end_period: pd.Period,
     months: int = 12,
+    retirement_pct: float | None = None,
+    education_per_month: float | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     periods = pd.period_range(end_period + 1, end_period + months, freq="M")
     inc_avg = _recent_average(inc_df, ["bank", "retirement"], end_period)
     exp_avg = _recent_average(exp_df, ["housing", "other"], end_period)
+    if retirement_pct is not None:
+        pct = retirement_pct
+        if pct > 1:
+            pct = pct / 100.0
+        pct = min(max(pct, 0.0), 1.0)
+        total_inc = inc_avg["bank"] + inc_avg["retirement"]
+        inc_avg["retirement"] = total_inc * pct
+        inc_avg["bank"] = total_inc - inc_avg["retirement"]
     proj_inc = pd.DataFrame(
         {
             "period": periods,
@@ -412,7 +507,7 @@ def build_projections(
             "retirement_summary": "Projection",
         }
     )
-    education_proj = _education_projection(periods, exp_df, end_period)
+    education_proj = _education_projection(periods, exp_df, end_period, per_month=education_per_month)
     proj_exp = pd.DataFrame(
         {
             "period": periods,
@@ -452,6 +547,18 @@ def _net_window_details(net_df: pd.DataFrame, window: int = 6) -> pd.Series:
     return pd.Series(details, index=net_df.index)
 
 
+def _net_current_details(net_df: pd.DataFrame) -> pd.Series:
+    """Single-month hover details for projected net cash flow."""
+    details = []
+    for _, row in net_df.iterrows():
+        label = row["period"].strftime("%b %Y")
+        income = int(round(row["bank"])) if not pd.isna(row["bank"]) else 0
+        exp = int(round(row["total_exp"])) if not pd.isna(row["total_exp"]) else 0
+        net = int(round(row["net_bank_flow"])) if not pd.isna(row["net_bank_flow"]) else 0
+        details.append(f"{label} +{income} -{exp} = {net}")
+    return pd.Series(details, index=net_df.index)
+
+
 def build_net_projection(proj_inc: pd.DataFrame, proj_exp: pd.DataFrame) -> pd.DataFrame:
     if proj_inc is None or proj_exp is None or proj_inc.empty or proj_exp.empty:
         return pd.DataFrame(columns=["period", "bank", "total_exp", "net_bank_flow", "net_window_details"])
@@ -462,7 +569,7 @@ def build_net_projection(proj_inc: pd.DataFrame, proj_exp: pd.DataFrame) -> pd.D
         how="inner",
     )
     merged["net_bank_flow"] = merged["bank"] - merged["total_exp"]
-    merged["net_window_details"] = _net_window_details(merged, window=6)
+    merged["net_window_details"] = _net_current_details(merged)
     return merged
 
 
@@ -568,10 +675,40 @@ def build_values_projection(
     ]
 
 
+def _yearly_income_expense(
+    inc_df: pd.DataFrame,
+    exp_df: pd.DataFrame,
+    proj_inc_df: pd.DataFrame | None,
+    proj_exp_df: pd.DataFrame | None,
+) -> tuple[dict[int, float], dict[int, float]]:
+    inc = inc_df.copy()
+    exp = exp_df.copy()
+    if proj_inc_df is not None and not proj_inc_df.empty:
+        inc = pd.concat([inc, proj_inc_df], ignore_index=True)
+    if proj_exp_df is not None and not proj_exp_df.empty:
+        exp = pd.concat([exp, proj_exp_df], ignore_index=True)
+    if inc.empty:
+        inc_totals = {}
+    else:
+        inc["year"] = inc["period"].dt.year
+        inc["total_income"] = inc.get("bank", 0.0) + inc.get("retirement", 0.0)
+        inc_totals = inc.groupby("year")["total_income"].sum().to_dict()
+    if exp.empty:
+        exp_totals = {}
+    else:
+        exp["year"] = exp["period"].dt.year
+        exp_totals = exp.groupby("year")["total_exp"].sum().to_dict()
+    return inc_totals, exp_totals
+
+
 def build_yearly_account_table(
     values_df: pd.DataFrame,
     proj_values_df: pd.DataFrame | None,
     end_period: pd.Period,
+    inc_df: pd.DataFrame,
+    exp_df: pd.DataFrame,
+    proj_inc_df: pd.DataFrame | None,
+    proj_exp_df: pd.DataFrame | None,
 ) -> list[dict]:
     if values_df.empty and (proj_values_df is None or proj_values_df.empty):
         return []
@@ -584,6 +721,7 @@ def build_yearly_account_table(
     year_groups = combined_sorted.groupby("year")
     year_end = year_groups.tail(1).sort_values("year").reset_index(drop=True)
     year_start = year_groups.head(1).set_index("year")
+    inc_totals, exp_totals = _yearly_income_expense(inc_df, exp_df, proj_inc_df, proj_exp_df)
     rows = []
     for _, row in year_end.iterrows():
         start_row = year_start.loc[row["year"]]
@@ -595,6 +733,8 @@ def build_yearly_account_table(
         projected = bool(row["period"] > end_period)
         rows.append(
             {
+                "income_total": int(round(inc_totals.get(int(row["year"]), 0.0))),
+                "expense_total": int(round(-abs(exp_totals.get(int(row["year"]), 0.0)))),
                 "year": int(row["year"]),
                 "bank_value": int(round(row["bank"])),
                 "bank_change": int(round(bank_change)),
@@ -608,6 +748,90 @@ def build_yearly_account_table(
             }
         )
     return rows
+
+
+def _expense_major_category(name: str) -> str:
+    if not name:
+        return "Uncategorized"
+    if name.startswith("Expenses:"):
+        remainder = name.split("Expenses:", 1)[1]
+        head = remainder.split(":", 1)[0].strip()
+        return head or "Uncategorized"
+    return "Uncategorized"
+
+
+def build_yearly_expense_pies(
+    df: pd.DataFrame,
+    start_year: int,
+    end_year: int,
+    threshold: float = 500.0,
+) -> list[dict]:
+    exp = df[df["full_account_name"].str.match(EXPENSE_ACCOUNT_PATTERN, na=False)].copy()
+    exp = exp[pd.notna(exp["date"])]
+    if exp.empty:
+        return []
+    exp["year"] = exp["date"].dt.year
+    exp = exp[exp["year"].between(start_year, end_year)]
+    if exp.empty:
+        return []
+    exp["major_category"] = exp["full_account_name"].apply(_expense_major_category)
+    exp["signed_value"] = exp["value"]
+    exp["abs_value"] = exp["signed_value"].abs()
+
+    grouped = exp.groupby(["year", "major_category"])["signed_value"].sum().reset_index()
+
+    pies = []
+    for year in sorted(grouped["year"].unique()):
+        year_groups = grouped[grouped["year"] == year].copy()
+        year_groups = year_groups[year_groups["signed_value"] > 0]
+        if year_groups.empty:
+            continue
+        year_groups = year_groups.sort_values("signed_value", ascending=False)
+        year_total = float(year_groups["signed_value"].sum())
+        labels = []
+        values = []
+        hovers = []
+        for _, row in year_groups.iterrows():
+            category = row["major_category"]
+            cat_total = float(row["signed_value"])
+            labels.append(category)
+            values.append(cat_total)
+            big_items = exp[
+                (exp["year"] == year)
+                & (exp["major_category"] == category)
+                & (exp["abs_value"] >= threshold)
+            ].copy()
+            if big_items.empty:
+                details = "No expenses >= $1000"
+            else:
+                big_items = big_items.sort_values("abs_value", ascending=False)
+                parts = []
+                for _, item in big_items.iterrows():
+                    label = item["description"] or item["full_account_name"].split(":")[-1]
+                    date_str = item["date"].strftime("%b %d")
+                    amount = int(round(item["signed_value"]))
+                    amount_str = f"${abs(amount)}"
+                    if amount < 0:
+                        amount_str = f"(-{amount_str})"
+                    parts.append(f"{date_str} {label} ({amount_str})")
+                details = "<br>".join(parts)
+            pct = 0.0
+            if year_total > 0:
+                pct = (cat_total / year_total) * 100.0
+            hover = (
+                f"Category total: ${int(round(cat_total))} ({pct:.0f}%)<br>"
+                f"{details}"
+            )
+            hovers.append(hover)
+        pies.append(
+            {
+                "year": int(year),
+                "labels": labels,
+                "values": values,
+                "hover": hovers,
+            }
+        )
+    return pies
 
 
 def _summarize_account_values(group: pd.DataFrame, threshold: float = 500.0) -> str:
@@ -706,8 +930,8 @@ def _price_series_for_commodity(
     ]
     if all_prices:
         all_prices = sorted(all_prices, key=lambda x: x[0])
-    start = periods.min().to_timestamp(how="start").tz_localize(None)
-    end = periods.max().to_timestamp(how="end").tz_localize(None)
+    start = periods.min().to_timestamp(how="start").tz_localize(None).floor("s")
+    end = periods.max().to_timestamp(how="end").tz_localize(None).ceil("s")
     if symbol and not cached_prices:
         need_fetch = True
         if all_prices:
@@ -863,7 +1087,9 @@ def monthly_account_values(
     per_account_full = pd.concat(filled, ignore_index=True)
 
     summaries = (
-        per_account_full.groupby(["window_period", "account_type"])
+        per_account_full.groupby(["window_period", "account_type"])[
+            ["full_account_name", "balance"]
+        ]
         .apply(_summarize_account_values)
         .reset_index(name="summary")
     )
@@ -929,6 +1155,7 @@ def build_plotly_data(
     proj_net_df=None,
     proj_values_df=None,
     yearly_table=None,
+    yearly_expense_pies=None,
 ):
     # Monthly Income
     inc_traces = [
@@ -1214,6 +1441,7 @@ def build_plotly_data(
         "netflow": net_trace,
         "values": value_traces,
         "yearly_account_table": yearly_table or [],
+        "yearly_expense_pies": yearly_expense_pies or [],
     }
 
 
@@ -1224,11 +1452,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>Financial Report – Line Charts Only</title>
+<title>Financial Report</title>
 <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
 <style>
   body {{font-family:Arial,Helvetica,sans-serif; margin:20px;}}
-  .chart {{margin-bottom:45px;}}
+  .chart-section {{margin-bottom:45px;}}
+  .chart {{margin-bottom:0;}}
   table {{border-collapse:collapse;width:100%;margin-top:20px;}}
   th, td {{border:1px solid #ddd;padding:8px;text-align:center;}}
   th {{background:#f2f2f2;}}
@@ -1238,12 +1467,26 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </head>
 <body>
 
-<h1>Financial Report – Line Charts Only</h1>
+<h1>Financial Report</h1>
 
-<div id="income" class="chart"></div>
-<div id="expenses" class="chart"></div>
-<div id="netflow" class="chart"></div>
-<div id="values" class="chart"></div>
+<div class="chart-section">
+  <div id="income" class="chart"></div>
+</div>
+
+<div class="chart-section">
+  <div id="expenses" class="chart"></div>
+</div>
+
+<div class="chart-section">
+  <div id="netflow" class="chart"></div>
+</div>
+
+<div class="chart-section">
+  <div id="values" class="chart"></div>
+</div>
+
+<h2>Yearly Expense Categories</h2>
+<div id="expense_pies" class="chart"></div>
 
 <h2>Yearly Account Totals</h2>
 <p>Values reflect the end of each year, with change shown relative to the first month of that year.</p>
@@ -1251,42 +1494,201 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
 <script>
   const plotData = {plot_json};
+  const gridColor = 'rgba(0,0,0,0.08)';
+  const yearLineColor = 'rgba(0,0,0,0.12)';
+
+  function cloneTraces(traces) {{
+    return traces.map(trace => Object.assign({{}}, trace));
+  }}
+
+  function yearChangeShapes(traces) {{
+    const yearStarts = new Set();
+    traces.forEach(trace => {{
+      (trace.x || []).forEach(x => {{
+        if (typeof x === 'string' && x.endsWith('-01')) {{
+          yearStarts.add(x);
+        }}
+      }});
+    }});
+    return Array.from(yearStarts).sort().map(x => ({{
+      type: 'line',
+      xref: 'x',
+      yref: 'paper',
+      x0: x,
+      x1: x,
+      y0: 0,
+      y1: 1,
+      line: {{color: yearLineColor, width: 1}},
+    }}));
+  }}
+
+  function percentile99(values) {{
+    if (!values.length) {{
+      return 0;
+    }}
+    const sorted = values.slice().sort((a, b) => a - b);
+    const idx = Math.floor(0.99 * (sorted.length - 1));
+    return sorted[idx];
+  }}
+
+  function applyOutlierClipping(traces) {{
+    const next = cloneTraces(traces);
+    const combined = [];
+    traces.forEach(trace => {{
+      (trace.y || []).forEach(val => {{
+        if (typeof val === 'number' && !Number.isNaN(val)) {{
+          combined.push(val);
+        }}
+      }});
+    }});
+    const z = percentile99(combined);
+    if (z <= 0) {{
+      return next;
+    }}
+    const cap = 2 * z;
+    next.forEach((trace, idx) => {{
+      const originalY = (traces[idx].y || []).slice();
+      const originalCustom = traces[idx].customdata || [];
+      const marker = Object.assign({{}}, trace.marker || {{}});
+      const symbols = originalY.map(val => (val > cap ? 'cross' : 'circle'));
+      trace.marker = Object.assign(marker, {{symbol: symbols}});
+      trace.customdata = originalY.map((val, i) => [val, originalCustom[i] || '']);
+      trace.y = originalY.map(val => (val > cap ? cap : val));
+      if (trace.hovertemplate) {{
+        trace.hovertemplate = trace.hovertemplate
+          .replace(/%{{y(?::[^}}]*)?}}/g, '%{{customdata[0]:.0f}}')
+          .replace(/%{{customdata}}/g, '%{{customdata[1]}}');
+      }}
+    }});
+    return next;
+  }}
+
+  function buildLayout(title, traces) {{
+    const shapes = yearChangeShapes(traces);
+    const baseLayout = {{
+      title,
+      xaxis: {{title: 'Month'}},
+      legend: {{orientation: 'h', x: 0.5, xanchor: 'center', y: -0.25, yanchor: 'top'}},
+      margin: {{t: 50, b: 80}},
+      shapes,
+    }};
+    baseLayout.yaxis = {{
+      title: 'USD',
+      showgrid: true,
+      gridcolor: gridColor,
+      gridwidth: 1,
+      autorange: true,
+    }};
+    return baseLayout;
+  }}
 
   // ---- Income ----
-  Plotly.newPlot('income', plotData.income, {{
-    title: 'Monthly Income – Bank vs Retirement',
-    xaxis: {{title:'Month'}},
-    yaxis: {{title:'USD'}},
-    legend: {{orientation:'h', x:0.5, xanchor:'center', y:-0.25, yanchor:'top'}},
-    margin: {{t:50, b:80}}
-  }});
+  const incomeTraces = applyOutlierClipping(plotData.income);
+  Plotly.newPlot(
+    'income',
+    incomeTraces,
+    buildLayout('Monthly Income – Bank vs Retirement', incomeTraces)
+  );
 
   // ---- Expenses ----
-  Plotly.newPlot('expenses', plotData.expenses, {{
-    title: 'Monthly Expenses – Education, Housing, Other',
-    xaxis: {{title:'Month'}},
-    yaxis: {{title:'USD'}},
-    legend: {{orientation:'h', x:0.5, xanchor:'center', y:-0.25, yanchor:'top'}},
-    margin: {{t:50, b:80}}
-  }});
+  const expenseTraces = applyOutlierClipping(plotData.expenses);
+  Plotly.newPlot(
+    'expenses',
+    expenseTraces,
+    buildLayout('Monthly Expenses – Education, Housing, Other', expenseTraces)
+  );
 
   // ---- Net Cash Flow ----
-  Plotly.newPlot('netflow', plotData.netflow, {{
-    title: 'Net Cash Flow (Bank Income – All Expenses)',
-    xaxis: {{title:'Month'}},
-    yaxis: {{title:'USD'}},
-    legend: {{orientation:'h', x:0.5, xanchor:'center', y:-0.25, yanchor:'top'}},
-    margin: {{t:50, b:80}}
-  }});
+  const netflowTraces = applyOutlierClipping(plotData.netflow);
+  Plotly.newPlot(
+    'netflow',
+    netflowTraces,
+    buildLayout('Net Cash Flow (Bank Income – All Expenses)', netflowTraces)
+  );
 
   // ---- Account Values by Year ----
-  Plotly.newPlot('values', plotData.values, {{
-    title: 'Account Values by Month',
-    xaxis: {{title:'Month'}},
-    yaxis: {{title:'USD'}},
-    legend: {{orientation:'h', x:0.5, xanchor:'center', y:-0.25, yanchor:'top'}},
-    margin: {{t:50, b:80}}
+  const valueTraces = applyOutlierClipping(plotData.values);
+  Plotly.newPlot(
+    'values',
+    valueTraces,
+    buildLayout('Account Values by Month', valueTraces)
+  );
+
+  // ---- Yearly Expense Pies ----
+  const pieContainer = document.getElementById('expense_pies');
+  if (!plotData.yearly_expense_pies || plotData.yearly_expense_pies.length === 0) {{
+    pieContainer.textContent = 'No yearly expense data available.';
+  }} else {{
+    const pieTraces = [];
+    const annotations = [];
+    const cols = plotData.yearly_expense_pies.length;
+    const globalTotals = {{}};
+    plotData.yearly_expense_pies.forEach(yearData => {{
+      yearData.labels.forEach((label, i) => {{
+        globalTotals[label] = (globalTotals[label] || 0) + (yearData.values[i] || 0);
+      }});
+    }});
+    const labelOrder = Object.keys(globalTotals).sort((a, b) => globalTotals[b] - globalTotals[a]);
+    const palette = [
+      '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b',
+      '#e377c2', '#7f7f7f', '#bcbd22', '#17becf', '#aec7e8', '#ffbb78',
+      '#98df8a', '#ff9896', '#c5b0d5', '#c49c94', '#f7b6d2', '#c7c7c7',
+      '#dbdb8d', '#9edae5',
+    ];
+    const colorMap = {{}};
+    labelOrder.forEach((label, idx) => {{
+      colorMap[label] = palette[idx % palette.length];
+    }});
+    labelOrder.forEach(label => {{
+    pieTraces.push({{
+      type: 'scatter',
+      mode: 'markers',
+      x: [0],
+      y: [0],
+      name: label,
+      marker: {{color: colorMap[label], size: 10, symbol: 'square'}},
+      hoverinfo: 'skip',
+      showlegend: true,
+    }});
   }});
+    plotData.yearly_expense_pies.forEach((yearData, idx) => {{
+      const ordered = labelOrder.filter(label => yearData.labels.includes(label));
+      const values = ordered.map(label => yearData.values[yearData.labels.indexOf(label)] || 0);
+      const hover = ordered.map(label => yearData.hover[yearData.labels.indexOf(label)] || '');
+      const colors = ordered.map(label => colorMap[label]);
+      pieTraces.push({{
+        type: 'pie',
+        labels: ordered,
+        values,
+        textinfo: 'none',
+        hovertemplate: '%{{label}}<br>%{{customdata}}<extra></extra>',
+        customdata: hover,
+        marker: {{colors}},
+        sort: false,
+        domain: {{row: 0, column: idx}},
+        name: String(yearData.year),
+        showlegend: false,
+      }});
+      annotations.push({{
+        text: String(yearData.year),
+        x: (idx + 0.5) / cols,
+        y: 1.12,
+        xref: 'paper',
+        yref: 'paper',
+        showarrow: false,
+        font: {{size: 12}},
+      }});
+    }});
+    Plotly.newPlot('expense_pies', pieTraces, {{
+      grid: {{rows: 1, columns: cols}},
+      showlegend: true,
+      legend: {{x: 1.02, xanchor: 'left', y: 0.5, yanchor: 'middle'}},
+      margin: {{t: 40, b: 20, l: 10, r: 140}},
+      xaxis: {{visible: false}},
+      yaxis: {{visible: false}},
+      annotations,
+    }});
+  }}
 
   // ---- Yearly Account Totals ----
   const yearlyTbl = document.createElement('table');
@@ -1294,7 +1696,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     document.getElementById('yearly_account_table').textContent = 'No yearly data available.';
   }} else {{
     const hdr = yearlyTbl.insertRow();
-    const cols = Object.keys(plotData.yearly_account_table[0]).filter(c => c !== 'projected');
+    const allCols = Object.keys(plotData.yearly_account_table[0]).filter(c => c !== 'projected');
+    const cols = ['year', ...allCols.filter(c => c !== 'year')];
     cols.forEach(c => {{
       const th = document.createElement('th');
       th.textContent = c;
@@ -1326,19 +1729,30 @@ def write_html(out_path: Path, plot_json: dict):
     """Save the final HTML file."""
     html = HTML_TEMPLATE.format(plot_json=json.dumps(plot_json))
     out_path.write_text(html, encoding="utf-8")
-    print(f"\n✅ Report written to: {out_path.resolve()}\n")
+    return out_path.resolve()
 
 
 # ----------------------------------------------------------------------
 # 5️⃣  Main driver
 # ----------------------------------------------------------------------
-def main(gnucash_file: str, out_file: str = "report.html", start_year: int = 2021, end_year: int = None):
+def main(
+    gnucash_file: str,
+    out_file: str = "report.html",
+    start_year: int = 2021,
+    end_year: int = None,
+    detail_threshold: float = 500.0,
+    retirement_pct: float | None = None,
+    education_per_month: float | None = None,
+):
     gnucash_path = Path(gnucash_file)
     out_path = Path(out_file)
 
     # Load & enrich data
-    df_raw, pricedb = load_gnucash(gnucash_path)
+    progress = ProgressTracker("Generating report")
+    progress.update(0.02)
+    df_raw, pricedb = load_gnucash(gnucash_path, progress_tracker=progress)
     df_all = enrich(df_raw)
+    progress.update(0.5)
     end_year_is_default = end_year is None
     if end_year_is_default:
         end_period = pd.Period(datetime.now().strftime("%Y-%m"), freq="M")
@@ -1350,21 +1764,30 @@ def main(gnucash_file: str, out_file: str = "report.html", start_year: int = 202
     ]
 
     # Monthly aggregations
-    inc_month = monthly_income(df)
-    exp_month = monthly_expenses(df)
+    inc_month = monthly_income(df, detail_threshold)
+    exp_month = monthly_expenses(df, detail_threshold)
     net_month = net_cash_flow(inc_month, exp_month)
+    progress.update(0.7)
     values_month, account_details = monthly_account_values(
         df_all,
         pricedb,
         return_details=True,
     )
+    progress.update(0.82)
     values_month = values_month[
         (values_month["period"] >= start_period) & (values_month["period"] <= end_period)
     ]
     proj_inc = proj_exp = None
     proj_net = proj_values = None
     if end_year_is_default:
-        proj_inc, proj_exp = build_projections(inc_month, exp_month, end_period, months=12)
+        proj_inc, proj_exp = build_projections(
+            inc_month,
+            exp_month,
+            end_period,
+            months=12,
+            retirement_pct=retirement_pct,
+            education_per_month=education_per_month,
+        )
         proj_net = build_net_projection(proj_inc, proj_exp)
         proj_values = build_values_projection(
             values_month,
@@ -1373,12 +1796,27 @@ def main(gnucash_file: str, out_file: str = "report.html", start_year: int = 202
             end_period,
             account_details,
         )
+    progress.update(0.9)
 
     # Yearly aggregation and balances
     balances  = latest_balances(df)   # kept for completeness
 
     # Build Plotly JSON and write HTML
-    yearly_table = build_yearly_account_table(values_month, proj_values, end_period)
+    yearly_table = build_yearly_account_table(
+        values_month,
+        proj_values,
+        end_period,
+        inc_month,
+        exp_month,
+        proj_inc,
+        proj_exp,
+    )
+    yearly_expense_pies = build_yearly_expense_pies(
+        df,
+        start_period.year,
+        end_period.year,
+        threshold=detail_threshold,
+    )
     plot_json = build_plotly_data(
         inc_month,
         exp_month,
@@ -1390,8 +1828,12 @@ def main(gnucash_file: str, out_file: str = "report.html", start_year: int = 202
         proj_net_df=proj_net,
         proj_values_df=proj_values,
         yearly_table=yearly_table,
+        yearly_expense_pies=yearly_expense_pies,
     )
-    write_html(out_path, plot_json)
+    progress.update(0.96)
+    report_path = write_html(out_path, plot_json)
+    progress.update(1.0)
+    print(f"✅ Report written to: {report_path}\n")
 
 
 if __name__ == "__main__":
@@ -1405,5 +1847,19 @@ if __name__ == "__main__":
                         help="First year to include (default: 2021)")
     parser.add_argument("--end-year", type=int, default=None,
                         help="Last year to include (default: current year)")
+    parser.add_argument("--detail-threshold", type=float, default=500.0,
+                        help="Detail threshold for transaction summaries (default: 500)")
+    parser.add_argument("--proj-retirement-pct", type=float, default=None,
+                        help="Retirement share of projected income (0-1 or 0-100)")
+    parser.add_argument("--proj-education-per-month", type=float, default=None,
+                        help="Projected education expense per active month")
     args = parser.parse_args()
-    main(args.gnucash, args.output, args.start_year, args.end_year)
+    main(
+        args.gnucash,
+        args.output,
+        args.start_year,
+        args.end_year,
+        detail_threshold=args.detail_threshold,
+        retirement_pct=args.proj_retirement_pct,
+        education_per_month=args.proj_education_per_month,
+    )
