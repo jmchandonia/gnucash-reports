@@ -81,6 +81,22 @@ def _parse_fraction(value: str) -> float:
     return float(value)
 
 
+def _parse_date_arg(value: str, *, default_month: int) -> pd.Period | None:
+    if value is None:
+        return None
+    match = re.fullmatch(r"(\d{4})(?:-(\d{2})(?:-(\d{2}))?)?", value.strip())
+    if not match:
+        raise ValueError(f"Expected YYYY, YYYY-MM, or YYYY-MM-DD; got {value!r}")
+    year = int(match.group(1))
+    month = int(match.group(2)) if match.group(2) else default_month
+    day = int(match.group(3)) if match.group(3) else 1
+    try:
+        datetime(year, month, day)
+    except ValueError as exc:
+        raise ValueError(f"Invalid date {value!r}") from exc
+    return pd.Period(f"{year}-{month:02d}", freq="M")
+
+
 def _render_progress(label: str, pct: float) -> None:
     pct = min(max(pct, 0.0), 1.0)
     bar_len = 30
@@ -482,14 +498,18 @@ def _education_projection(
 def build_projections(
     inc_df: pd.DataFrame,
     exp_df: pd.DataFrame,
-    end_period: pd.Period,
-    months: int = 12,
+    anchor_period: pd.Period,
+    proj_start: pd.Period,
+    proj_end: pd.Period,
     retirement_pct: float | None = None,
     education_per_month: float | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    periods = pd.period_range(end_period + 1, end_period + months, freq="M")
-    inc_avg = _recent_average(inc_df, ["bank", "retirement"], end_period)
-    exp_avg = _recent_average(exp_df, ["housing", "other"], end_period)
+    if proj_start is None or proj_end is None or proj_start > proj_end:
+        empty = pd.DataFrame(columns=["period"])
+        return empty, empty
+    periods = pd.period_range(proj_start, proj_end, freq="M")
+    inc_avg = _recent_average(inc_df, ["bank", "retirement"], anchor_period)
+    exp_avg = _recent_average(exp_df, ["housing", "other"], anchor_period)
     if retirement_pct is not None:
         pct = retirement_pct
         if pct > 1:
@@ -507,7 +527,7 @@ def build_projections(
             "retirement_summary": "Projection",
         }
     )
-    education_proj = _education_projection(periods, exp_df, end_period, per_month=education_per_month)
+    education_proj = _education_projection(periods, exp_df, anchor_period, per_month=education_per_month)
     proj_exp = pd.DataFrame(
         {
             "period": periods,
@@ -1738,8 +1758,10 @@ def write_html(out_path: Path, plot_json: dict):
 def main(
     gnucash_file: str,
     out_file: str = "report.html",
-    start_year: int = 2021,
-    end_year: int = None,
+    start: str = "2021",
+    end: str | None = None,
+    proj_start: str | None = None,
+    proj_end: str | None = None,
     detail_threshold: float = 500.0,
     retirement_pct: float | None = None,
     education_per_month: float | None = None,
@@ -1747,18 +1769,28 @@ def main(
     gnucash_path = Path(gnucash_file)
     out_path = Path(out_file)
 
+    start_period = _parse_date_arg(start, default_month=1)
+    if start_period is None:
+        raise ValueError("Start date is required.")
+    if end is None:
+        end_period = pd.Period(datetime.now().strftime("%Y-%m"), freq="M")
+    else:
+        end_period = _parse_date_arg(end, default_month=12)
+    if end_period is None:
+        raise ValueError("End date is required.")
+    if start_period > end_period:
+        raise ValueError("Start date must be on or before end date.")
+
+    proj_start_period = _parse_date_arg(proj_start, default_month=1)
+    proj_end_period = _parse_date_arg(proj_end, default_month=12)
+
     # Load & enrich data
     progress = ProgressTracker("Generating report")
     progress.update(0.02)
     df_raw, pricedb = load_gnucash(gnucash_path, progress_tracker=progress)
     df_all = enrich(df_raw)
     progress.update(0.5)
-    end_year_is_default = end_year is None
-    if end_year_is_default:
-        end_period = pd.Period(datetime.now().strftime("%Y-%m"), freq="M")
-    else:
-        end_period = pd.Period(f"{end_year}-12", freq="M")
-    start_period = pd.Period(f"{start_year}-01", freq="M")
+    end_year_is_default = end is None
     df = df_all[
         df_all["window_period"].between(start_period, end_period)
     ]
@@ -1779,12 +1811,39 @@ def main(
     ]
     proj_inc = proj_exp = None
     proj_net = proj_values = None
-    if end_year_is_default:
+    if proj_start_period is not None or proj_end_period is not None:
+        if proj_start_period is None:
+            proj_start_period = end_period + 1
+        if proj_end_period is None:
+            proj_end_period = proj_start_period + 11
+        if proj_start_period > proj_end_period:
+            raise ValueError("Projection start must be on or before projection end.")
         proj_inc, proj_exp = build_projections(
             inc_month,
             exp_month,
             end_period,
-            months=12,
+            proj_start_period,
+            proj_end_period,
+            retirement_pct=retirement_pct,
+            education_per_month=education_per_month,
+        )
+        proj_net = build_net_projection(proj_inc, proj_exp)
+        proj_values = build_values_projection(
+            values_month,
+            proj_net,
+            proj_inc,
+            end_period,
+            account_details,
+        )
+    elif end_year_is_default:
+        proj_start_period = end_period + 1
+        proj_end_period = end_period + 12
+        proj_inc, proj_exp = build_projections(
+            inc_month,
+            exp_month,
+            end_period,
+            proj_start_period,
+            proj_end_period,
             retirement_pct=retirement_pct,
             education_per_month=education_per_month,
         )
@@ -1843,10 +1902,14 @@ if __name__ == "__main__":
     parser.add_argument("gnucash", help="Path to the GnuCash .gnucash file")
     parser.add_argument("-o", "--output", default="report.html",
                         help="Filename for the HTML report (default: report.html)")
-    parser.add_argument("--start-year", type=int, default=2021,
-                        help="First year to include (default: 2021)")
-    parser.add_argument("--end-year", type=int, default=None,
-                        help="Last year to include (default: current year)")
+    parser.add_argument("--start", default="2021",
+                        help="Start date for report window (YYYY, YYYY-MM, or YYYY-MM-DD)")
+    parser.add_argument("--end", default=None,
+                        help="End date for report window (YYYY, YYYY-MM, or YYYY-MM-DD)")
+    parser.add_argument("--proj-start", default=None,
+                        help="Start date for projections (YYYY, YYYY-MM, or YYYY-MM-DD)")
+    parser.add_argument("--proj-end", default=None,
+                        help="End date for projections (YYYY, YYYY-MM, or YYYY-MM-DD)")
     parser.add_argument("--detail-threshold", type=float, default=500.0,
                         help="Detail threshold for transaction summaries (default: 500)")
     parser.add_argument("--proj-retirement-pct", type=float, default=None,
@@ -1854,12 +1917,17 @@ if __name__ == "__main__":
     parser.add_argument("--proj-education-per-month", type=float, default=None,
                         help="Projected education expense per active month")
     args = parser.parse_args()
-    main(
-        args.gnucash,
-        args.output,
-        args.start_year,
-        args.end_year,
-        detail_threshold=args.detail_threshold,
-        retirement_pct=args.proj_retirement_pct,
-        education_per_month=args.proj_education_per_month,
-    )
+    try:
+        main(
+            args.gnucash,
+            args.output,
+            args.start,
+            args.end,
+            proj_start=args.proj_start,
+            proj_end=args.proj_end,
+            detail_threshold=args.detail_threshold,
+            retirement_pct=args.proj_retirement_pct,
+            education_per_month=args.proj_education_per_month,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
